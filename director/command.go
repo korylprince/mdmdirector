@@ -96,7 +96,12 @@ func SendCommand(commandPayload types.CommandPayload) (types.Command, error) {
 		},
 	)
 
-	db.DB.Create(&command)
+	// The command is already on its way to the device. Without this row its result
+	// can't be matched back, so it would get no retry or ack bookkeeping and the
+	// queue dedupe wouldn't see it.
+	if err := db.DB.Create(&command).Error; err != nil {
+		return command, errors.Wrapf(err, "record sent command %s", command.CommandUUID)
+	}
 
 	return command, nil
 }
@@ -161,7 +166,12 @@ func sendCommandWithClient(nanoClient *mdm.NanoMDMClient, commandPayload types.C
 		CommandUUID:        command.CommandUUID,
 	})
 
-	db.DB.Create(&command)
+	// The command is already on its way to the device. Without this row its result
+	// can't be matched back, so it would get no retry or ack bookkeeping and the
+	// queue dedupe wouldn't see it.
+	if err := db.DB.Create(&command).Error; err != nil {
+		return command, errors.Wrapf(err, "record sent command %s", command.CommandUUID)
+	}
 
 	return command, nil
 }
@@ -226,38 +236,35 @@ OuterLoop:
 		},
 	)
 
-	if err := db.DB.Where("device_ud_id = ? AND command_uuid = ?", device.UDID, ackEvent.CommandUUID).Error; err != nil {
-		if intErrors.Is(err, gorm.ErrRecordNotFound) {
-			return errors.New("Command not found in the queue")
+	// Record the result on the command's row. A result for a command mdmdirector has no
+	// row for (one enqueued directly on the MDM server, or whose row was expired) is
+	// still a valid response: the caller goes on to process its payload. It just has no
+	// retry or ack bookkeeping to do here.
+	errorString := ""
+	if ackEvent.Status == "Error" {
+		ErrorLogger(LogHolder{Message: "Error response received", Metric: string(ackEvent.RawPayload), DeviceUDID: device.UDID, DeviceSerial: device.SerialNumber, CommandUUID: ackEvent.CommandUUID, CommandRequestType: commandRequestType})
+		errorString = string(ackEvent.RawPayload)
+	}
+	result := db.DB.Model(&command).Select("status", "error_string").Where("device_ud_id = ? AND command_uuid = ?", device.UDID, ackEvent.CommandUUID).Updates(types.Command{
+		Status:      ackEvent.Status,
+		ErrorString: errorString,
+	})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		InfoLogger(LogHolder{Message: "Command not found in the queue, result not recorded", CommandStatus: ackEvent.Status, CommandUUID: ackEvent.CommandUUID, DeviceUDID: device.UDID, DeviceSerial: device.SerialNumber, CommandRequestType: commandRequestType})
+		return nil
+	}
+
+	switch {
+	case ackEvent.Status == "Error" && commandRequestType == "InstallProfile":
+		if err := retryErroredInstallProfile(device, ackEvent.CommandUUID); err != nil {
+			ErrorLogger(LogHolder{DeviceUDID: device.UDID, DeviceSerial: device.SerialNumber, CommandUUID: ackEvent.CommandUUID, Message: "retryErroredInstallProfile: " + err.Error()})
 		}
-	} else {
-		if ackEvent.Status == "Error" {
-			ErrorLogger(LogHolder{Message: "Error response received", Metric: string(ackEvent.RawPayload), DeviceUDID: device.UDID, DeviceSerial: device.SerialNumber, CommandUUID: ackEvent.CommandUUID, CommandRequestType: commandRequestType})
-			err := db.DB.Model(&command).Select("status", "error_string").Where("device_ud_id = ? AND command_uuid = ?", device.UDID, ackEvent.CommandUUID).Updates(types.Command{
-				Status:      ackEvent.Status,
-				ErrorString: string(ackEvent.RawPayload),
-			}).Error
-			if err != nil {
-				return err
-			}
-			if commandRequestType == "InstallProfile" {
-				if err := retryErroredInstallProfile(device, ackEvent.CommandUUID); err != nil {
-					ErrorLogger(LogHolder{DeviceUDID: device.UDID, DeviceSerial: device.SerialNumber, CommandUUID: ackEvent.CommandUUID, Message: "retryErroredInstallProfile: " + err.Error()})
-				}
-			}
-		} else {
-			err := db.DB.Model(&command).Select("status", "error_string").Where("device_ud_id = ? AND command_uuid = ?", device.UDID, ackEvent.CommandUUID).Updates(types.Command{
-				Status:      ackEvent.Status,
-				ErrorString: "",
-			}).Error
-			if err != nil {
-				return err
-			}
-			if ackEvent.Status == "Acknowledged" {
-				if err := recordProfileAck(device, ackEvent.CommandUUID); err != nil {
-					ErrorLogger(LogHolder{DeviceUDID: device.UDID, DeviceSerial: device.SerialNumber, CommandUUID: ackEvent.CommandUUID, Message: err.Error()})
-				}
-			}
+	case ackEvent.Status == "Acknowledged":
+		if err := recordProfileAck(device, ackEvent.CommandUUID); err != nil {
+			ErrorLogger(LogHolder{DeviceUDID: device.UDID, DeviceSerial: device.SerialNumber, CommandUUID: ackEvent.CommandUUID, Message: err.Error()})
 		}
 	}
 	return nil
@@ -371,7 +378,7 @@ func ClearCommands(device *types.Device) error {
 func GetAllCommands(w http.ResponseWriter, r *http.Request) {
 	var commands []types.Command
 
-	err := db.DB.Find(&commands).Scan(&commands).Error
+	err := db.DB.Find(&commands).Error
 	if err != nil {
 		log.Errorf("Couldn't scan to Commands model: %v", err)
 	}
@@ -475,7 +482,7 @@ func DeletePendingCommands(w http.ResponseWriter, r *http.Request) {
 func GetErrorCommands(w http.ResponseWriter, r *http.Request) {
 	var commands []types.Command
 
-	err := db.DB.Find(&commands).Where("status = ?", "Error").Scan(&commands).Error
+	err := db.DB.Where("status = ?", "Error").Find(&commands).Error
 	if err != nil {
 		log.Errorf("Couldn't scan to Commands model: %v", err)
 	}

@@ -46,9 +46,6 @@ func mockVerifyLoads(mockSpy sqlmock.Sqlmock, lastStatus string) {
 		WithArgs(retryTestUDID).
 		WillReturnRows(sqlmock.NewRows([]string{"payload_identifier", "device_ud_id", "hashed_payload_uuid", "mobileconfig_data", "installed"}).
 			AddRow(retryTestProfileID, retryTestUDID, retryTestHash, []byte("<plist/>"), true))
-	// Find(...).Scan(...) issues the shared profile load twice
-	mockSpy.ExpectQuery(`SELECT \* FROM "shared_profiles"`).
-		WillReturnRows(sqlmock.NewRows([]string{"payload_identifier"}))
 	mockSpy.ExpectQuery(`SELECT \* FROM "shared_profiles"`).
 		WillReturnRows(sqlmock.NewRows([]string{"payload_identifier"}))
 	mockSpy.ExpectQuery(`SELECT DISTINCT ON \(identifier\) identifier, content_hash, status FROM commands WHERE device_ud_id = \$1 AND request_type = \$2 ORDER BY identifier, updated_at DESC`).
